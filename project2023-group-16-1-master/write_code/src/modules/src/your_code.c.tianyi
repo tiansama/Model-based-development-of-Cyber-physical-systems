@@ -1,0 +1,339 @@
+#include "your_code.h"
+
+
+#define DEG2RAD (3.14159265358979323846 / 180.0)
+#define RAD2DEG (180.0 / 3.14159265358979323846)
+/***
+ *
+ * This file is where you should add you tasks. You already know the structure
+ * Required to do so from the work with the simulator.
+ *
+ * The function yourCodeInit() is set to automatically execute when the
+ * quadrotor is started. This is where you need to create your tasks. The
+ * scheduler that runs the tasks is already up and running so you should
+ * NOT make a call to vTaskStartScheduler();.
+ *
+ * Below that you can find a few examples of useful function calls and code snippets.
+ *
+ * For further reference on how this is done: Look into the file stabilizer.c
+ * which usually handles the control of the crazyflie.
+ *
+ ***/
+
+// NO NEED TO CHANGE THIS
+static bool emergencyStop = false;
+static int emergencyStopTimeout = EMERGENCY_STOP_TIMEOUT_DISABLED;
+static StateEstimatorType estimatorType;
+// END NO NEED TO CHANGE THIS
+
+STATIC_MEM_TASK_ALLOC(mycontroller, configMINIMAL_STACK_SIZE);
+STATIC_MEM_TASK_ALLOC(myfilter, configMINIMAL_STACK_SIZE); //space for task
+
+static void mycontroller(void* param);
+static void myfilter(void* param);
+
+static sensorData_t sensorData;
+static uint16_t motors[4];
+static state_t state;
+static setpoint_t setpoint;
+
+SemaphoreHandle_t motors_sem;
+SemaphoreHandle_t sensors_sem;
+SemaphoreHandle_t estimate_sem;
+SemaphoreHandle_t references_sem;
+
+void yourCodeInit(void)
+{
+  estimatorType = getStateEstimator();
+	motors_sem     = xSemaphoreCreateBinary(); xSemaphoreGive(motors_sem);
+  references_sem = xSemaphoreCreateBinary(); xSemaphoreGive(references_sem);
+  sensors_sem    = xSemaphoreCreateBinary(); xSemaphoreGive(sensors_sem);
+  estimate_sem   = xSemaphoreCreateBinary(); xSemaphoreGive(estimate_sem);
+	/*
+   * CREATE AND EXECUTE YOUR TASKS FROM HERE
+   */
+	STATIC_MEM_TASK_CREATE(myfilter, myfilter,"myfilter", NULL, 1);
+  STATIC_MEM_TASK_CREATE(mycontroller, mycontroller,"mycontroller", NULL, 2);
+}
+
+/* 
+* ADD TASKS HERE
+*/
+static void mycontroller(void *pvParameters)
+{
+  uint32_t tick;
+  uint32_t lastWakeTime;
+  lastWakeTime = xTaskGetTickCount();
+
+ 
+  while(!sensorsAreCalibrated()) {
+      vTaskDelayUntil(&lastWakeTime, F2T(RATE_MAIN_LOOP));
+  }
+  tick = 1;
+
+    // we keep local copies of the global state + semaphores
+    unsigned short motors[4];
+    double gyro_data[3];
+    double acc_data[3];
+    double r_rpdy[3];
+    double estimate[3] = {0.0};
+    double error[5] = {0.0};
+    double gain[4][5] = {
+        {-0.240498254993081, -0.010010849697055, -0.356389954344025, -0.014836037608414, -0.057607712247082},
+        {-0.240498254993080, -0.010010849697055, 0.356389954344011, 0.014836037608413, 0.057607712247082},
+        {0.240498254993084, 0.010010849697057, 0.356389954343960, 0.014836037608413, -0.057607712247082},
+        {0.240498254993077, 0.010010849697057, -0.356389954343947, -0.014836037608413, 0.057607712247082}}; // ModelForCrazyfile.m, Q_x = diag([1000 1 1000 1 1]), Q_u = eye(4)
+    unsigned short base_thrust = 29000;
+
+
+    while (1)
+    {
+        // read sensor data (gyro)
+        
+        vTaskDelayUntil(&lastWakeTime, F2T(RATE_100_HZ));
+        sensorsAcquire(&sensorData, tick);
+        stateEstimator(&state, tick);
+        commanderGetSetpoint(&setpoint, &state);
+
+        xSemaphoreTake(sensors_sem, portMAX_DELAY);
+        gyro_data[0] = sensorData.gyro.x;
+        gyro_data[1] = sensorData.gyro.y;
+        gyro_data[2] = sensorData.gyro.z;
+        xSemaphoreGive(sensors_sem);
+
+        // read filter data (angle estimates)
+        xSemaphoreTake(estimate_sem, portMAX_DELAY);
+        estimate[0] = state.attitude.roll;
+        estimate[1] = state.attitude.pitch;
+        estimate[2] = state.attitude.yaw;
+        xSemaphoreGive(estimate_sem);
+
+        // read latest references
+        xSemaphoreTake(references_sem, portMAX_DELAY);
+        memcpy(r_rpdy, params->r_rpdy, sizeof(r_rpdy));
+        xSemaphoreGive(references_sem);
+
+        // compute error
+        error[0] = DEG2RAD * (r_rpdy[0] - estimate[0]);
+        error[1] = DEG2RAD * (0.0 - gyro_data[0]);
+        error[2] = DEG2RAD * (r_rpdy[1] - estimate[1]);
+        error[3] = DEG2RAD * (0.0 - gyro_data[1]);
+        error[4] = DEG2RAD * (r_rpdy[2] - gyro_data[2]);
+
+        // compute motor outputs
+        motors[0] = base_thrust + (unsigned short)((1.0 / crazyflie_constants.pwm_n) * (error[0] * gain[0][0] + error[1] * gain[0][1] + error[2] * gain[0][2] + error[3] * gain[0][3] + error[4] * gain[0][4]));
+        motors[1] = base_thrust + (unsigned short)((1.0 / crazyflie_constants.pwm_n) * (error[0] * gain[1][0] + error[1] * gain[1][1] + error[2] * gain[1][2] + error[3] * gain[1][3] + error[4] * gain[1][4]));
+        motors[2] = base_thrust + (unsigned short)((1.0 / crazyflie_constants.pwm_n) * (error[0] * gain[2][0] + error[1] * gain[2][1] + error[2] * gain[2][2] + error[3] * gain[2][3] + error[4] * gain[2][4]));
+        motors[3] = base_thrust + (unsigned short)((1.0 / crazyflie_constants.pwm_n) * (error[0] * gain[3][0] + error[1] * gain[3][1] + error[2] * gain[3][2] + error[3] * gain[3][3] + error[4] * gain[3][4]));
+
+        // write motor output
+        xSemaphoreTake(motors_sem, portMAX_DELAY);
+        motorsSetRatio(MOTOR_M1, motors[0]);
+        motorsSetRatio(MOTOR_M2, motors[1]);
+        motorsSetRatio(MOTOR_M3, motors[2]);
+        motorsSetRatio(MOTOR_M4, motors[3]);
+        xSemaphoreGive(motors_sem);
+
+        // sleep 10ms to make this task run at 100Hz
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+static void myfilter(void *pvParameters)
+{
+  uint32_t tick;
+  uint32_t lastWakeTime;
+  lastWakeTime = xTaskGetTickCount();
+
+ 
+  while(!sensorsAreCalibrated()) {
+      vTaskDelayUntil(&lastWakeTime, F2T(RATE_MAIN_LOOP));
+  }
+  tick = 1;
+
+    // we keep local copies of the global state + semaphores
+  double gyro_data[3];
+  double acc_data[3];
+  double acc_angle[3];
+  double gamma = 0.99; // just enough to remove drift
+  double h = 0.01;
+
+    // copy the semaphore handles for convenience
+    // SemaphoreHandle_t sensors_sem = params->sensors_sem;
+    // SemaphoreHandle_t estimate_sem = params->estimate_sem;
+
+    // local internal state.
+  double estimate[3] = {0.0};
+
+  while (1){
+    vTaskDelayUntil(&lastWakeTime,F2T(RATE_100_HZ))
+      // read sensor data
+    sensorsAcquire(&lastWakeTime,tick);
+    xSemaphoreTake(sensors_sem, portMAX_DELAY);
+    acc_data[0] = sensorData.acc.x;
+    acc_data[1] = sensorData.acc.y;
+    acc_data[2] = sensorData.acc.z;
+    gyro_data[0] = sensorData.gyro.x;
+    gyro_data[1] = sensorData.gyro.y;
+    gyro_data[2] = sensorData.gyro.z;
+    xSemaphoreGive(sensors_sem);
+
+    // apply filter
+    acc_angle[0] = RAD2DEG * atan2(acc_data[1], acc_data[2]);
+    acc_angle[1] = RAD2DEG * atan2(-acc_data[0], sqrt(pow(acc_data[1], 2) + pow(acc_data[2], 2)));
+
+    estimate[0] = (1 - gamma) * acc_angle[0] + gamma * (estimate[0] + h * gyro_data[0]);
+    estimate[1] = (1 - gamma) * acc_angle[1] + gamma * (estimate[1] + h * gyro_data[1]);
+    estimate[2] = gamma * (estimate[2] + h * gyro_data[2]);
+
+        // write estimates output
+    xSemaphoreTake(estimate_sem, portMAX_DELAY);
+      // sleep 10ms to make this task run at 100Hz
+    state.attitude.roll = estimate[0];
+    state.attitude.pitch = estimate[1];
+    state.attitude.yaw = estimate[2];
+    xSemaphoreGive(estimate_sem);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+void stabilizerSetEmergencyStop()
+{
+  emergencyStop = true;
+}
+
+void stabilizerResetEmergencyStop()
+{
+  emergencyStop = false;
+}
+
+void stabilizerSetEmergencyStopTimeout(int timeout)
+{
+  emergencyStop = false;
+  emergencyStopTimeout = timeout;
+}
+
+/*************************************************
+ * CREATE A TASK (Example, a task with priority 5)
+ ************************************************/
+ //STATIC_MEM_TASK_ALLOC(yourTaskName, configMINIMAL_STACK_SIZE);
+ //STATIC_MEM_TASK_CREATE(yourTaskName, yourTaskName,
+ //   "TASK_IDENTIFIER_NAME", NULL, 5);
+
+/*************************************************
+ * WAIT FOR SENSORS TO BE CALIBRATED
+ ************************************************/
+// lastWakeTime = xTaskGetTickCount ();
+// while(!sensorsAreCalibrated()) {
+//     vTaskDelayUntil(&lastWakeTime, F2T(RATE_MAIN_LOOP));
+// }
+
+
+
+/*************************************************
+ * RETRIEVE THE MOST RECENT SENSOR DATA
+ *
+ * The code creates a variable called sensorData and then calls a function
+ * that fills this variable with the latest data from the sensors.
+ *
+ * sensorData_t sensorData = struct {
+ *     Axis3f acc;
+ *     Axis3f gyro;
+ *     Axis3f mag;
+ *     baro_t baro;
+ *     zDistance_t zrange;
+ *     point_t position;
+ * }
+ *
+ * Before starting the loop, initialize tick:
+ * uint32_t tick;
+ * tick = 1;
+ ************************************************/
+// sensorData_t sensorData;
+// sensorsAcquire(&sensorData, tick);
+
+
+
+/*************************************************
+ * RETRIEVE THE SET POINT FROM ANY EXTERNAL COMMAND INTERFACE
+ *
+ * The code creates a variable called setpoint and then calls a function
+ * that fills this variable with the latest command input.
+ *
+ * setpoint_t setpoint = struct {
+ *     uint32_t timestamp;
+ *
+ *     attitude_t attitude;      // deg
+ *     attitude_t attitudeRate;  // deg/s
+ *     quaternion_t attitudeQuaternion;
+ *     float thrust;
+ *     point_t position;         // m
+ *     velocity_t velocity;      // m/s
+ *     acc_t acceleration;       // m/s^2
+ *     bool velocity_body;       // true if velocity is given in body frame; false if velocity is given in world frame
+ *
+ *     struct {
+ *         stab_mode_t x;
+ *         stab_mode_t y;
+ *         stab_mode_t z;
+ *         stab_mode_t roll;
+ *         stab_mode_t pitch;
+ *         stab_mode_t yaw;
+ *         stab_mode_t quat;
+ *     } mode;
+ * }
+ *
+ ************************************************/
+// state_t state;
+// setpoint_t setpoint;
+// stateEstimator(&state, tick);
+// commanderGetSetpoint(&setpoint, &state);
+
+
+
+/*************************************************
+ * SENDING OUTPUT TO THE MOTORS
+ *
+ * The code sends an output to each motor. The output should have the be
+ * of the typ unsigned 16-bit integer, i.e. use variables such as:
+ * uint16_t value_i
+ *
+ ************************************************/
+// motorsSetRatio(MOTOR_M1, value_1);
+// motorsSetRatio(MOTOR_M2, value_2);
+// motorsSetRatio(MOTOR_M3, value_3);
+// motorsSetRatio(MOTOR_M4, value_4);
+
+
+/*************************************************
+ * LOGGING VALUES THAT CAN BE PLOTTEN IN PYTHON CLIENT
+ *
+ * We have already set up three log blocks to for the accelerometer data, the
+ * gyro data and the setpoints, just uncomment the block to start logging. Use
+ * them as reference if you want to add custom blocks.
+ *
+ ************************************************/
+
+/*
+LOG_GROUP_START(acc)
+LOG_ADD(LOG_FLOAT, x, &sensorData.acc.x)
+LOG_ADD(LOG_FLOAT, y, &sensorData.acc.y)
+LOG_ADD(LOG_FLOAT, z, &sensorData.acc.z)
+LOG_GROUP_STOP(acc)
+*/
+
+/*
+LOG_GROUP_START(gyro)
+LOG_ADD(LOG_FLOAT, x, &sensorData.gyro.x)
+LOG_ADD(LOG_FLOAT, y, &sensorData.gyro.y)
+LOG_ADD(LOG_FLOAT, z, &sensorData.gyro.z)
+LOG_GROUP_STOP(gyro)
+*/
+
+/*
+LOG_GROUP_START(ctrltarget)
+LOG_ADD(LOG_FLOAT, roll, &setpoint.attitude.roll)
+LOG_ADD(LOG_FLOAT, pitch, &setpoint.attitude.pitch)
+LOG_ADD(LOG_FLOAT, yaw, &setpoint.attitudeRate.yaw)
+LOG_GROUP_STOP(ctrltarget)
+*/

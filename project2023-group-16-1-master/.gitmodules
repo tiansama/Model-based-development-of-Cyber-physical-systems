@@ -1,0 +1,30 @@
+[submodule "vendor/CMSIS"]
+	path = generate_code/vendor/CMSIS
+	url = https://github.com/ARM-software/CMSIS_5.git
+[submodule "vendor/cmock"]
+	path = generate_code/vendor/cmock
+	url = https://github.com/throwtheswitch/cmock.git
+[submodule "vendor/libdw1000"]
+	path = generate_code/vendor/libdw1000
+	url = https://github.com/bitcraze/libdw1000.git
+[submodule "vendor/unity"]
+	path = generate_code/vendor/unity
+	url = https://github.com/throwtheswitch/unity.git
+[submodule "vendor/FreeRTOS"]
+	path = generate_code/vendor/FreeRTOS
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+[submodule "write_code/vendor/CMSIS"]
+	path = write_code/vendor/CMSIS
+	url = https://github.com/ARM-software/CMSIS_5.git
+[submodule "write_code/vendor/cmock"]
+	path = write_code/vendor/cmock
+	url = https://github.com/throwtheswitch/cmock.git
+[submodule "write_code/vendor/unity"]
+	path = write_code/vendor/unity
+	url = https://github.com/throwtheswitch/unity.git
+[submodule "write_code/vendor/libdw1000"]
+	path = write_code/vendor/libdw1000
+	url = https://github.com/bitcraze/libdw1000.git
+[submodule "write_code/vendor/FreeRTOS"]
+	path = write_code/vendor/FreeRTOS
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
